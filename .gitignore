@@ -1,0 +1,12 @@
+﻿__pycache__/
+*.py[cod]
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4a
+_vod_work_*/
+clip_output/
+EDITS/
+cookies.txt
+.env
