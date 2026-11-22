@@ -10,3 +10,9 @@ clip_output/
 EDITS/
 cookies.txt
 .env
+
+venv/
+clips_output/
+EDITS/
+FINAL_EDITS/
+cookies.txt

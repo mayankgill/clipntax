@@ -19,6 +19,9 @@ app = Flask(__name__)
 
 JOBS_LOCK = threading.Lock()
 JOBS: Dict[str, Dict[str, Any]] = {}
+MAX_CONCURRENT_WORKERS = max(1, min(8, int(os.environ.get("MAX_CONCURRENT_WORKERS", "3"))))
+JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_WORKERS)
+MAX_STORED_JOBS = 100
 
 
 def _parse_time_to_seconds(raw: Any) -> Optional[float]:
@@ -130,6 +133,8 @@ def _parse_manual_editor_payload(
 
 def _list_saved_edits() -> List[Dict[str, Any]]:
     edits_dir = get_edits_dir()
+    if not edits_dir.exists():
+        return []
     items: List[Dict[str, Any]] = []
     exts = {".mp4", ".mov", ".mkv", ".webm"}
     files = sorted(
@@ -170,6 +175,17 @@ def _build_spread_windows_for_run(
     return selected[shift:] + selected[:shift]
 
 
+def _prune_old_jobs_locked() -> None:
+    if len(JOBS) <= MAX_STORED_JOBS:
+        return
+    finished_ids = [
+        jid for jid, j in JOBS.items() if j.get("status") != "running"
+    ]
+    finished_ids.sort(key=lambda jid: JOBS[jid].get("created_at", 0.0))
+    for jid in finished_ids[: max(0, len(JOBS) - MAX_STORED_JOBS)]:
+        JOBS.pop(jid, None)
+
+
 def _run_edit_job(job_id: str, payload: Dict[str, Any]) -> None:
     def append_log(msg: str) -> None:
         with JOBS_LOCK:
@@ -179,20 +195,38 @@ def _run_edit_job(job_id: str, payload: Dict[str, Any]) -> None:
                 job["logs"] = job["logs"][-250:]
 
     stop_event: threading.Event = payload["stop_event"]
-    final_edits_count = max(1, min(20, int(payload.get("final_edits_count", 1))))
-    clip_selection_mode = payload.get("clip_selection_mode", "all_best")
-    backend_clip_mode = "all_good" if clip_selection_mode == "all_best" else "count"
-    effective_max_clips = 20 if clip_selection_mode == "all_best" else int(payload["max_clips"])
+    if stop_event.is_set():
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "stopped"
+        return
 
-    all_outputs: List[Dict[str, Any]] = []
-
-    append_log(
-        f"[{payload['label']}] Target: {final_edits_count} final edit(s) x {payload['edit_length']:.0f}s | "
-        f"Mode: {'ALL BEST CLIPS (full video spread)' if clip_selection_mode == 'all_best' else f'LIMITED ({effective_max_clips} clips)'} | "
-        f"Slice: {payload['clip_slice_sec']:.1f}s"
-    )
-
+    append_log(f"Waiting for render slot (max {MAX_CONCURRENT_WORKERS} concurrent renders)...")
+    JOB_SEMAPHORE.acquire()
     try:
+        if stop_event.is_set():
+            append_log("Stopped before render started.")
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if job is not None:
+                    job["status"] = "stopped"
+            return
+
+        final_edits_count = max(1, min(20, int(payload.get("final_edits_count", 1))))
+        clip_selection_mode = payload.get("clip_selection_mode", "all_best")
+        backend_clip_mode = "all_good" if clip_selection_mode == "all_best" else "count"
+        effective_max_clips = 20 if clip_selection_mode == "all_best" else int(payload["max_clips"])
+
+        all_outputs: List[Dict[str, Any]] = []
+        seen_paths = set()
+
+        append_log(
+            f"[{payload['label']}] Target: {final_edits_count} final edit(s) x {payload['edit_length']:.0f}s | "
+            f"Mode: {'ALL BEST CLIPS (full video spread)' if clip_selection_mode == 'all_best' else f'LIMITED ({effective_max_clips} clips)'} | "
+            f"Slice: {payload['clip_slice_sec']:.1f}s"
+        )
+
         for run_idx in range(1, final_edits_count + 1):
             if stop_event.is_set():
                 append_log(f"Stopped before final edit #{run_idx}/{final_edits_count}.")
@@ -238,13 +272,17 @@ def _run_edit_job(job_id: str, payload: Dict[str, Any]) -> None:
                 clip_slice_sec=payload["clip_slice_sec"],
             )
             for out_p in (outputs or []):
-                all_outputs.append(
-                    {
-                        "path": out_p,
-                        "name": Path(out_p).name,
-                        "url": f"/edits/{quote(Path(out_p).name)}",
-                    }
-                )
+                p_obj = Path(out_p)
+                norm_key = str(p_obj.resolve()) if p_obj.exists() else str(out_p)
+                if norm_key not in seen_paths:
+                    seen_paths.add(norm_key)
+                    all_outputs.append(
+                        {
+                            "path": out_p,
+                            "name": p_obj.name,
+                            "url": f"/edits/{quote(p_obj.name)}",
+                        }
+                    )
 
         with JOBS_LOCK:
             job = JOBS.get(job_id)
@@ -258,6 +296,8 @@ def _run_edit_job(job_id: str, payload: Dict[str, Any]) -> None:
             if job is not None:
                 job["error"] = str(exc)
                 job["status"] = "failed"
+    finally:
+        JOB_SEMAPHORE.release()
 
 
 def _spawn_job(
@@ -300,6 +340,7 @@ def _spawn_job(
     }
 
     with JOBS_LOCK:
+        _prune_old_jobs_locked()
         JOBS[job_id] = {
             "job_id": job_id,
             "label": label,
@@ -322,7 +363,7 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>CLIPNTAX — 9:16 Vertical Pipeline</title>
+<title>CLIPNTAX - 9:16 Vertical Pipeline</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -468,7 +509,7 @@ input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-
 .log-console{background:#04050a;border:1px solid var(--line);border-radius:var(--rs);padding:14px;height:230px;overflow-y:auto;font-family:var(--mono);font-size:11.5px;color:#b9c1d6;white-space:pre-wrap;line-height:1.65}
 .term-dots{display:flex;gap:6px;margin:16px 0 8px}.term-dots i{width:9px;height:9px;border-radius:50%;background:#2b3145}
 .term-dots i:nth-child(1){background:#fb4f7a}.term-dots i:nth-child(2){background:#fbbf24}.term-dots i:nth-child(3){background:#34d399}
-.jobs-title{font-size:12px;font-weight:600;color:#aab1c4;margin:18px 0 8px}
+.jobs-title{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:600;color:#aab1c4;margin:18px 0 8px}
 .active-jobs-list{display:flex;flex-direction:column;gap:7px;max-height:170px;overflow-y:auto}
 .job-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-radius:11px;background:var(--glass-2);border:1px solid var(--line);font-size:12px;cursor:pointer;transition:.2s}
 .job-row:hover{border-color:var(--line-2)}.job-row.selected{border-color:var(--p);background:rgba(124,108,255,.1)}
@@ -524,7 +565,7 @@ footer{text-align:center;color:#4d566b;font-size:12px;padding:70px 0 40px}
   <header class="hero reveal">
     <span class="eyebrow">✦ 9:16 Vertical Pipeline</span>
     <h1>Turn any video into <span class="grad">scroll-stopping edits</span></h1>
-    <p>Whole-video peak slicing, beat sync, spoken pop captions, manual clip control and multi-video batching — all in CLIPNTAX.</p>
+    <p>Whole-video peak slicing, beat sync, spoken pop captions, manual clip control and multi-video batching - all in CLIPNTAX.</p>
     <div class="hero-cta">
       <a href="#sec-studio" style="text-decoration:none"><button type="button" class="btn btn-primary btn-lg">Start Editing →</button></a>
       <a href="#sec-gallery" style="text-decoration:none"><button type="button" class="btn btn-ghost btn-lg">View Saved Edits</button></a>
@@ -668,7 +709,7 @@ footer{text-align:center;color:#4d566b;font-size:12px;padding:70px 0 40px}
           <div class="bar" id="runBar"><i></i></div>
           <div class="term-dots"><i></i><i></i><i></i></div>
           <div class="log-console" id="logConsole">Choose All Best Clips or Limited Clips, set Exact Final Edits Wanted, and click Generate.</div>
-          <div class="jobs-title">Active Jobs</div>
+          <div class="jobs-title"><span>Active Jobs</span><button type="button" class="btn btn-ghost btn-sm" id="stopAllBtn" onclick="stopAllActiveJobs()" style="display:none">Stop All</button></div>
           <div class="active-jobs-list" id="activeJobsList"><div class="empty">No jobs yet.</div></div>
         </section>
       </aside>
@@ -677,7 +718,7 @@ footer{text-align:center;color:#4d566b;font-size:12px;padding:70px 0 40px}
 
   <section class="block reveal" id="sec-gallery">
     <div class="sec-head">
-      <div><h2>Saved Edits</h2><p>Everything rendered to /EDITS — hover a card to preview.</p></div>
+      <div><h2>Saved Edits</h2><p>Everything rendered to /EDITS - hover a card to preview.</p></div>
       <button type="button" class="btn btn-ghost" onclick="refreshSavedEdits(true)">↻ Refresh Gallery</button>
     </div>
     <div class="edits-grid" id="savedEditsGrid">
@@ -991,6 +1032,14 @@ async function stopJob() {
   toast("Stop requested");
 }
 
+async function stopAllActiveJobs() {
+  for (const id of watchedJobIds) {
+    try { await fetch(`/api/stop/${id}`, { method: "POST" }); } catch (e) {}
+  }
+  setStatus("Stopping all...", true);
+  toast("Stop sent to active jobs");
+}
+
 async function pollAllJobs() {
   if (!watchedJobIds.length) return;
   const results = await Promise.all(watchedJobIds.map(async id => {
@@ -1000,7 +1049,7 @@ async function pollAllJobs() {
   if (!valid.length) return;
 
   $("activeJobsList").innerHTML = valid.map(j => `
-    <div class="job-row ${j.job_id === selectedJobId ? "selected" : ""}" onclick="selectJob('${esc(j.job_id)}')">
+    <div class="job-row ${j.job_id === selectedJobId ? "selected" : ""}" data-jid="${esc(j.job_id)}" onclick="selectJob('${esc(j.job_id)}')">
       <span class="lbl">${esc(j.label || j.job_id)}</span>
       <span class="job-state ${esc(j.status)}">${esc(j.status)}</span>
     </div>`).join("");
@@ -1018,6 +1067,7 @@ async function pollAllJobs() {
   const anyRunning = runningCount > 0;
   $("generateBtn").disabled = anyRunning;
   $("stopBtn").disabled = !anyRunning;
+  $("stopAllBtn").style.display = anyRunning ? "inline-flex" : "none";
   $("runBar").classList.toggle("on", anyRunning);
   setStatus(anyRunning ? `Running (${runningCount} active)` : "Completed", anyRunning);
 
@@ -1146,6 +1196,9 @@ def _extract_common_settings(form_data) -> Tuple[float, int, float, str, str, bo
         clip_slice_sec = 6.5
 
     fit_mode = (form_data.get("fit_mode") or "blurred_bg").strip()
+    if fit_mode not in {"blurred_bg", "center_crop", "letterbox"}:
+        fit_mode = "blurred_bg"
+
     music_query = (form_data.get("music_query") or "").strip()
     enable_captions = form_data.get("enable_captions") is not None
 
